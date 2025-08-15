@@ -2,7 +2,8 @@
 
 help:
 	@echo "Knights and Knaves GPT - Available commands:"
-	@echo "  make setup        - Install uv and set up the project"
+	@echo "  make setup        - Install uv and set up the project (pyproject.toml mode)"
+	@echo "  make setup-simple - Install uv and set up the project (requirements.txt mode)"
 	@echo "  make install      - Install dependencies with uv"
 	@echo "  make sync         - Sync dependencies with uv"
 	@echo "  make update       - Update dependencies to latest versions"
@@ -15,8 +16,11 @@ help:
 setup:
 	@bash scripts/setup.sh
 
+setup-simple:
+	@bash scripts/setup_simple.sh
+
 install:
-	uv sync
+	uv pip install -r requirements.txt
 
 sync:
 	uv sync

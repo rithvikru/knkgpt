@@ -8,9 +8,15 @@ if ! command -v uv &> /dev/null; then
     exit 1
 fi
 
-# Ensure dependencies are installed
-echo "Checking dependencies with uv..."
-uv sync
+# Ensure virtual environment exists
+if [ ! -d ".venv" ]; then
+    echo "Creating virtual environment..."
+    uv venv
+    echo "Installing dependencies..."
+    uv pip install -r requirements.txt
+else
+    echo "Using existing virtual environment..."
+fi
 
 # Activate virtual environment if not already activated
 if [[ "$VIRTUAL_ENV" != *".venv"* ]]; then

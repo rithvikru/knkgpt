@@ -124,12 +124,15 @@ cd knkgpt
 
 2. Install dependencies with uv:
 ```bash
-# Create virtual environment and install dependencies
-uv sync
+# Option 1: Simple setup (recommended for most users)
+make setup-simple
 
-# Or install with specific Python version
-uv python install 3.10
-uv sync
+# Option 2: Full pyproject.toml setup
+make setup
+
+# Or manually:
+uv venv --python 3.12
+uv pip install -r requirements.txt
 ```
 
 3. Activate the environment:
