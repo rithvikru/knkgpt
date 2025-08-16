@@ -23,7 +23,7 @@ import wandb
 # Add the parent directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from data import get_knights_knaves
+from data.knights_knaves import get
 from mingpt.dataset import CharDataset
 from mingpt.model import GPT, GPTConfig
 from mingpt.trainer import Trainer, TrainerConfig
@@ -204,7 +204,7 @@ def main():
 
     # Load dataset
     print(f"Loading Knights and Knaves dataset from {args.data_path}...")
-    knights_knaves = get_knights_knaves(
+    knights_knaves = get(
         data_path=args.data_path,
         max_games=args.max_games,
         val_split=0.01,  # Small validation set for 100M dataset
