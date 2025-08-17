@@ -9,8 +9,6 @@ from datetime import datetime
 
 from mingpt.model import GPT, GPTConfig
 from mingpt.trainer import Trainer, TrainerConfig
-from mingpt.dataset import KnightsKnavesDataModule
-from mingpt.pretokenized_dataset import PreTokenizedDataModule
 from mingpt.utils import set_seed
 from mingpt.wandb_utils import init_wandb, finish_run
 
@@ -67,6 +65,7 @@ def main():
     
     if args.pretokenized_dir:
         print(f"Using pre-tokenized data from: {args.pretokenized_dir}")
+        from mingpt.pretokenized_dataset import PreTokenizedDataModule
         data_module = PreTokenizedDataModule(
             data_dir=args.pretokenized_dir,
             batch_size=args.batch_size,
@@ -78,6 +77,7 @@ def main():
         )
     else:
         print(f"Loading raw data from: {args.data_path}")
+        from mingpt.dataset import KnightsKnavesDataModule
         data_module = KnightsKnavesDataModule(
             data_path=args.data_path,
             batch_size=args.batch_size,
