@@ -1,183 +1,263 @@
 """
-Simple training loop; Boilerplate that could apply to any arbitrary neural network,
-so nothing in this file really has anything to do with GPT specifically.
+Trainer for Knights and Knaves GPT.
 """
-
-import math
-import logging
-
+import os
+import torch
+import torch.nn as nn
+from torch.nn.parallel import DataParallel
 from tqdm import tqdm
 import numpy as np
+from typing import Optional, Dict, Any, Callable
+import time
 
-import torch
-import torch.optim as optim
-from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data.dataloader import DataLoader
+from .utils import save_checkpoint, evaluate_puzzle_accuracy, print_puzzle_examples
+from .wandb_utils import log_metrics, log_puzzle_examples as log_puzzle_examples_wandb
 
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-
-try:
-    from .wandb_utils import get_system_metrics, log_model_gradients, log_model_weights
-    WANDB_UTILS_AVAILABLE = True
-except ImportError:
-    WANDB_UTILS_AVAILABLE = False
-
-logger = logging.getLogger(__name__)
 
 class TrainerConfig:
-    # optimization parameters
+    """Configuration for training."""
+    # Optimization parameters
     max_epochs = 10
     batch_size = 64
-    learning_rate = 3e-4
+    learning_rate = 6e-4
     betas = (0.9, 0.95)
     grad_norm_clip = 1.0
-    weight_decay = 0.1 # only applied on matmul weights
-    # learning rate decay params: linear warmup followed by cosine decay to 10% of original
-    lr_decay = False
-    warmup_tokens = 375e6 # these two numbers come from the GPT-3 paper, but may not be good defaults elsewhere
-    final_tokens = 260e9 # (at what point we reach 10% of original LR)
-    # checkpoint settings
-    ckpt_path = None
-    num_workers = 0 # for DataLoader
-
+    weight_decay = 0.1
+    # Learning rate schedule
+    lr_decay = True
+    warmup_tokens = 375e6  # 375 million tokens
+    final_tokens = 100e9   # 100 billion tokens
+    # Checkpointing
+    ckpt_dir = './ckpts/knkgpt'
+    save_every = 1000
+    # Logging
+    log_every = 10
+    eval_every = 500
+    eval_samples = 1000
+    # System
+    num_workers = 4
+    device = 'cuda'
+    
     def __init__(self, **kwargs):
-        for k,v in kwargs.items():
+        for k, v in kwargs.items():
             setattr(self, k, v)
 
+
 class Trainer:
-    def __init__(self, model, train_dataset, test_dataset, config):
+    """Trainer for GPT model."""
+    
+    def __init__(self, model, train_dataset, val_dataset, config):
         self.model = model
         self.train_dataset = train_dataset
-        self.test_dataset = test_dataset
+        self.val_dataset = val_dataset
         self.config = config
-        self.use_wandb = False  # Will be set by the training script
-        self.iteration = 0  # Global iteration counter
-
-        # take over whatever gpus are on the system
-        self.device = 'cpu'
-        if torch.cuda.is_available():
-            self.device = torch.cuda.current_device()
-            self.model = torch.nn.DataParallel(self.model).to(self.device)
-
-    def save_checkpoint(self):
-        # DataParallel wrappers keep raw model object in .module attribute
-        raw_model = self.model.module if hasattr(self.model, "module") else self.model
-        logger.info("saving %s", self.config.ckpt_path)
-        torch.save(raw_model.state_dict(), self.config.ckpt_path)
-
-    def train(self):
-        model, config = self.model, self.config
-        raw_model = model.module if hasattr(self.model, "module") else model
-        optimizer = raw_model.configure_optimizers(config)
-
-        def run_epoch(split):
-            is_train = split == 'train'
-            model.train(is_train)
-            data = self.train_dataset if is_train else self.test_dataset
-            loader = DataLoader(data, shuffle=True, pin_memory=True,
-                                batch_size=config.batch_size,
-                                num_workers=config.num_workers)
-
-            losses = []
-            pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y) in pbar:
-
-                # place data on the correct device
-                x = x.to(self.device)  # [B, T]
-                y = y.to(self.device)  # [B, T]
-
-                # forward the model
-                with torch.set_grad_enabled(is_train):
-                    logits, loss = model(x, y)
-                    loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
-                    losses.append(loss.item())
-
-                if is_train:
-                    # backprop and update the parameters
-                    model.zero_grad()
-                    loss.backward()
-                    self.grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                    optimizer.step()
-
-                    # decay the learning rate based on our progress
-                    if config.lr_decay:
-                        self.tokens += (y >= 0).sum() # number of tokens processed this step (i.e. label is not -100)
-                        if self.tokens < config.warmup_tokens:
-                            # linear warmup
-                            lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
-                        else:
-                            # cosine learning rate decay
-                            progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
-                            lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-                        lr = config.learning_rate * lr_mult
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = lr
-                    else:
-                        lr = config.learning_rate
-
-                    # report progress
-                    pbar.set_description(f"epoch {epoch+1} iter {it}: train loss {loss.item():.5f}. lr {lr:e}")
-                    
-                    # Log to wandb
-                    if self.use_wandb and WANDB_AVAILABLE:
-                        self.iteration += 1
-                        metrics = {
-                            "train/loss": loss.item(),
-                            "train/lr": lr,
-                            "train/epoch": epoch,
-                            "train/iteration": self.iteration,
-                            "train/tokens_seen": self.tokens if hasattr(self, 'tokens') else 0,
-                        }
-                        
-                        # Log gradient norm if available
-                        if hasattr(self, 'grad_norm'):
-                            metrics["train/grad_norm"] = self.grad_norm
-                        
-                        # Add system metrics
-                        if WANDB_UTILS_AVAILABLE:
-                            system_metrics = get_system_metrics()
-                            metrics.update(system_metrics)
-                            
-                            # Log gradient and weight statistics periodically
-                            if self.iteration % 100 == 0:
-                                log_model_gradients(model, self.iteration)
-                                log_model_weights(model, self.iteration)
-                        else:
-                            # Fallback to basic GPU metrics
-                            if torch.cuda.is_available():
-                                gpu_id = torch.cuda.current_device()
-                                metrics[f"system/gpu_memory_allocated"] = torch.cuda.memory_allocated(gpu_id) / 1024**3  # GB
-                                metrics[f"system/gpu_memory_reserved"] = torch.cuda.memory_reserved(gpu_id) / 1024**3  # GB
-                        
-                        wandb.log(metrics)
-                        
-                        # Call validation callback if defined
-                        if hasattr(self, 'validation_callback'):
-                            self.validation_callback(self, epoch, self.iteration)
-
-            if not is_train:
-                test_loss = float(np.mean(losses))
-                logger.info("test loss: %f", test_loss)
-                return test_loss
-
-        best_loss = float('inf')
-        self.tokens = 0 # counter used for learning rate decay
-        for epoch in range(config.max_epochs):
-
-            run_epoch('train')
-            if self.test_dataset is not None:
-                test_loss = run_epoch('test')
-
-            # supports early stopping based on the test loss, or just save always if no test set is provided
-            if self.config.ckpt_path is not None:
-                if self.test_dataset is None:
-                    self.save_checkpoint()
-                    continue
-                if test_loss < best_loss:
-                    best_loss = test_loss
-                    self.save_checkpoint()
+        
+        # Create checkpoint directory
+        os.makedirs(config.ckpt_dir, exist_ok=True)
+        
+        # Take over whatever gpus are on the system
+        self.device = config.device
+        if self.device == 'cuda':
+            self.model = self.model.cuda()
+            if torch.cuda.device_count() > 1:
+                print(f"Using {torch.cuda.device_count()} GPUs")
+                self.model = DataParallel(self.model)
                 
+        self.raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        
+        # Set up optimizer
+        self.optimizer = self.raw_model.configure_optimizers(config)
+        
+        # Training state
+        self.tokens = 0  # Counter for processed tokens
+        self.global_step = 0
+        self.current_epoch = 0
+        
+    def train(self):
+        """Main training loop."""
+        model, config = self.model, self.config
+        
+        # Create data loaders
+        train_loader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=True,
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=True,
+        )
+        
+        model.train()
+        best_val_loss = float('inf')
+        
+        # Training metrics
+        train_losses = []
+        val_losses = []
+        
+        start_time = time.time()
+        
+        for epoch in range(config.max_epochs):
+            self.current_epoch = epoch
+            epoch_losses = []
+            
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.max_epochs}")
+            
+            for batch_idx, batch in enumerate(pbar):
+                # Get data
+                x = batch['input'].to(self.device)
+                y = batch['target'].to(self.device)
+                
+                # Forward pass
+                logits, loss = model(x, y)
+                epoch_losses.append(loss.item())
+                
+                # Backward pass
+                model.zero_grad()
+                loss.backward()
+                if config.grad_norm_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
+                self.optimizer.step()
+                
+                # Decay learning rate if configured
+                if config.lr_decay:
+                    self.tokens += (y >= 0).sum()  # Count non-padding tokens
+                    if self.tokens < config.warmup_tokens:
+                        # Linear warmup
+                        lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
+                    else:
+                        # Cosine decay
+                        progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
+                        lr_mult = max(0.1, 0.5 * (1.0 + np.cos(np.pi * progress)))
+                    
+                    lr = config.learning_rate * lr_mult
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = lr
+                else:
+                    lr = config.learning_rate
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'lr': f"{lr:.2e}",
+                    'tokens': f"{self.tokens/1e6:.1f}M"
+                })
+                
+                # Log metrics
+                if self.global_step % config.log_every == 0:
+                    log_metrics({
+                        'train/loss': loss.item(),
+                        'train/lr': lr,
+                        'train/tokens': self.tokens,
+                        'train/epoch': epoch + batch_idx / len(train_loader),
+                    }, step=self.global_step)
+                
+                # Evaluation
+                if self.global_step % config.eval_every == 0:
+                    val_loss = self.evaluate(val_loader)
+                    val_losses.append(val_loss)
+                    
+                    # Evaluate puzzle accuracy
+                    eval_results = evaluate_puzzle_accuracy(
+                        self.raw_model,
+                        val_loader,
+                        self.train_dataset.tokenizer,
+                        device=self.device,
+                        max_samples=config.eval_samples
+                    )
+                    
+                    log_metrics({
+                        'val/loss': val_loss,
+                        'val/accuracy': eval_results['overall_accuracy'],
+                        'val/correct': eval_results['correct_solutions'],
+                        'val/total': eval_results['total_puzzles'],
+                    }, step=self.global_step)
+                    
+                    # Log accuracy by solution type
+                    for sol_type, stats in eval_results['solution_type_accuracy'].items():
+                        log_metrics({
+                            f'val/accuracy_{sol_type}': stats['accuracy'],
+                        }, step=self.global_step)
+                    
+                    print(f"\nVal Loss: {val_loss:.4f}, Accuracy: {eval_results['overall_accuracy']:.2%}")
+                    
+                    # Save best model
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(
+                            self.raw_model,
+                            self.optimizer,
+                            epoch,
+                            self.global_step,
+                            val_loss,
+                            os.path.join(config.ckpt_dir, 'best_model.pt'),
+                            config=config.__dict__
+                        )
+                    
+                    model.train()
+                
+                # Save checkpoint
+                if self.global_step % config.save_every == 0:
+                    save_checkpoint(
+                        self.raw_model,
+                        self.optimizer,
+                        epoch,
+                        self.global_step,
+                        epoch_losses[-1] if epoch_losses else 0,
+                        os.path.join(config.ckpt_dir, f'checkpoint_{self.global_step}.pt'),
+                        config=config.__dict__
+                    )
+                
+                self.global_step += 1
+            
+            # End of epoch
+            train_losses.extend(epoch_losses)
+            
+            # Print examples
+            print(f"\n{'='*80}")
+            print(f"End of Epoch {epoch + 1} - Example Predictions:")
+            print_puzzle_examples(
+                self.raw_model,
+                val_loader,
+                self.train_dataset.tokenizer,
+                device=self.device,
+                n_examples=3
+            )
+            
+        # Training complete
+        elapsed = time.time() - start_time
+        print(f"\nTraining complete in {elapsed/3600:.2f} hours")
+        
+        # Save final model
+        save_checkpoint(
+            self.raw_model,
+            self.optimizer,
+            self.current_epoch,
+            self.global_step,
+            val_losses[-1] if val_losses else 0,
+            os.path.join(config.ckpt_dir, 'final_model.pt'),
+            config=config.__dict__
+        )
+        
+        return train_losses, val_losses
+    
+    @torch.no_grad()
+    def evaluate(self, dataloader):
+        """Evaluate model on validation set."""
+        self.model.eval()
+        losses = []
+        
+        for batch in dataloader:
+            x = batch['input'].to(self.device)
+            y = batch['target'].to(self.device)
+            
+            logits, loss = self.model(x, y)
+            losses.append(loss.item())
+            
+        return np.mean(losses)

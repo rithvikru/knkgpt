@@ -34,7 +34,6 @@ ckpts/
 
 # Data files
 *.jsonl
-!data/n_2.jsonl  # Keep the reference to expected data file
 
 # Logs
 *.log

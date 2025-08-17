@@ -1,85 +1,85 @@
 #!/bin/bash
-# Launch script for distributed training on 8xB200 GPUs
 
-# Check if uv is installed
-if ! command -v uv &> /dev/null; then
-    echo "Error: uv is not installed. Please install it with:"
-    echo "curl -LsSf https://astral.sh/uv/install.sh | sh"
-    exit 1
-fi
+# Launch training script for KnightKnaves GPT
 
-# Ensure virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment..."
-    uv venv
-    echo "Installing dependencies..."
-    uv pip install -r requirements.txt
-else
-    echo "Using existing virtual environment..."
-fi
-
-# Activate virtual environment if not already activated
-if [[ "$VIRTUAL_ENV" != *".venv"* ]]; then
-    echo "Activating virtual environment..."
-    source .venv/bin/activate
-fi
-
-# Set environment variables for better performance
-export OMP_NUM_THREADS=8
-export CUDA_LAUNCH_BLOCKING=0
-
-# Path to the data file
-DATA_PATH="data/n_2.jsonl"
-
-# Training hyperparameters optimized for 8xB200 GPUs
-BATCH_SIZE=1024  # Per GPU batch size (8k total)
-MAX_EPOCHS=5     # Adjust based on convergence
-LEARNING_RATE=6e-4
-N_LAYER=8       # Larger model for 100M dataset
+# Default configuration
+DATA_PATH="./data/n_2.jsonl"
+PRETOKENIZED_DIR=""
+N_LAYER=8
 N_HEAD=8
 N_EMBD=512
+BATCH_SIZE=64
+MAX_EPOCHS=10
+LEARNING_RATE=6e-4
 
-# Wandb configuration
-WANDB_PROJECT="knights-knaves-gpt"
-WANDB_RUN_NAME=""  # Leave empty for auto-generated name
-# Set WANDB_DISABLED=1 to disable wandb logging
-WANDB_DISABLED=${WANDB_DISABLED:-0}
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --small)
+            echo "Using small model configuration"
+            N_LAYER=4
+            N_HEAD=4
+            N_EMBD=256
+            BATCH_SIZE=128
+            shift
+            ;;
+        --large)
+            echo "Using large model configuration"
+            N_LAYER=12
+            N_HEAD=12
+            N_EMBD=768
+            BATCH_SIZE=32
+            shift
+            ;;
+        --debug)
+            echo "Debug mode - using subset of data"
+            N_PUZZLES=10000
+            MAX_EPOCHS=2
+            shift
+            ;;
+        --pretokenized)
+            echo "Using pre-tokenized data"
+            PRETOKENIZED_DIR="./data/tokenized"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--small|--large] [--debug] [--pretokenized]"
+            exit 1
+            ;;
+    esac
+done
 
-# For testing with smaller dataset first
-# Add --max-games 1000000 to use only 1M puzzles for initial testing
+# Create checkpoint directory
+mkdir -p ./ckpts/knkgpt
 
-echo "Starting distributed training on 8 GPUs..."
-echo "Total batch size: $((BATCH_SIZE * 8))"
-echo "Dataset: ${DATA_PATH}"
+# Launch training
+echo "Starting KnightKnaves GPT training..."
+echo "Model config: ${N_LAYER} layers, ${N_HEAD} heads, ${N_EMBD} embedding dim"
+echo "Batch size: ${BATCH_SIZE}"
+echo "Max epochs: ${MAX_EPOCHS}"
 
-# Prepare wandb arguments
-WANDB_ARGS=""
-if [ "${WANDB_DISABLED}" = "1" ]; then
-    WANDB_ARGS="--wandb-disabled"
-    echo "Wandb logging is disabled"
+if [ -n "${PRETOKENIZED_DIR}" ]; then
+    echo "Using pre-tokenized data from: ${PRETOKENIZED_DIR}"
+    python train_gpt_knights_knaves.py \
+        --pretokenized_dir ${PRETOKENIZED_DIR} \
+        --n_layer ${N_LAYER} \
+        --n_head ${N_HEAD} \
+        --n_embd ${N_EMBD} \
+        --batch_size ${BATCH_SIZE} \
+        --max_epochs ${MAX_EPOCHS} \
+        --learning_rate ${LEARNING_RATE} \
+        --wandb_project knkgpt
 else
-    WANDB_ARGS="--wandb-project ${WANDB_PROJECT}"
-    if [ -n "${WANDB_RUN_NAME}" ]; then
-        WANDB_ARGS="${WANDB_ARGS} --wandb-run-name ${WANDB_RUN_NAME}"
-    fi
-    echo "Wandb project: ${WANDB_PROJECT}"
+    echo "Using raw data from: ${DATA_PATH}"
+    python train_gpt_knights_knaves.py \
+        --data_path ${DATA_PATH} \
+        --n_layer ${N_LAYER} \
+        --n_head ${N_HEAD} \
+        --n_embd ${N_EMBD} \
+        --batch_size ${BATCH_SIZE} \
+        --max_epochs ${MAX_EPOCHS} \
+        --learning_rate ${LEARNING_RATE} \
+        --wandb_project knkgpt \
+        ${N_PUZZLES:+--n_puzzles ${N_PUZZLES}}
 fi
-
-# Launch with torchrun for distributed training
-# Using uv run ensures the correct environment is used
-uv run torchrun \
-    --nproc_per_node=8 \
-    --master_port=29500 \
-    train_gpt_knights_knaves.py \
-    --data-path "${DATA_PATH}" \
-    --batch-size ${BATCH_SIZE} \
-    --max-epochs ${MAX_EPOCHS} \
-    --learning-rate ${LEARNING_RATE} \
-    --n-layer ${N_LAYER} \
-    --n-head ${N_HEAD} \
-    --n-embd ${N_EMBD} \
-    --checkpoint-dir ./ckpts \
-    --validate-every 1000 \
-    ${WANDB_ARGS}
-
-echo "Training completed!"

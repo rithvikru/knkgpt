@@ -1,104 +1,72 @@
 """
-Utilities for Weights & Biases logging and monitoring
+Weights & Biases logging utilities.
 """
-
-import torch
-import psutil
-import GPUtil
 import wandb
+from typing import Dict, Any, Optional
+import os
 
 
-def get_system_metrics():
-    """Get comprehensive system metrics for monitoring"""
-    metrics = {}
+def init_wandb(
+    project: str = "knkgpt",
+    name: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    tags: Optional[list] = None,
+    notes: Optional[str] = None,
+):
+    """Initialize wandb run."""
+    run = wandb.init(
+        project=project,
+        name=name,
+        config=config,
+        tags=tags,
+        notes=notes,
+        reinit=True,
+    )
     
-    # CPU metrics
-    metrics["system/cpu_percent"] = psutil.cpu_percent(interval=0.1)
-    metrics["system/cpu_freq_mhz"] = psutil.cpu_freq().current if psutil.cpu_freq() else 0
+    # Log code
+    wandb.run.log_code(".")
     
-    # Memory metrics
-    memory = psutil.virtual_memory()
-    metrics["system/memory_used_gb"] = memory.used / 1024**3
-    metrics["system/memory_percent"] = memory.percent
-    metrics["system/memory_available_gb"] = memory.available / 1024**3
-    
-    # GPU metrics (if available)
-    if torch.cuda.is_available():
-        gpu_id = torch.cuda.current_device()
-        
-        # PyTorch CUDA metrics
-        metrics["system/gpu_memory_allocated_gb"] = torch.cuda.memory_allocated(gpu_id) / 1024**3
-        metrics["system/gpu_memory_reserved_gb"] = torch.cuda.memory_reserved(gpu_id) / 1024**3
-        
-        # Try to get more detailed GPU metrics using GPUtil
-        try:
-            gpus = GPUtil.getGPUs()
-            if gpu_id < len(gpus):
-                gpu = gpus[gpu_id]
-                metrics["system/gpu_utilization_percent"] = gpu.load * 100
-                metrics["system/gpu_memory_utilization_percent"] = gpu.memoryUtil * 100
-                metrics["system/gpu_temperature_c"] = gpu.temperature
-                metrics["system/gpu_power_draw_w"] = gpu.powerDraw if gpu.powerDraw else 0
-        except:
-            pass
-    
-    # Disk I/O metrics
-    try:
-        disk_io = psutil.disk_io_counters()
-        if disk_io:
-            metrics["system/disk_read_mb_s"] = disk_io.read_bytes / 1024**2
-            metrics["system/disk_write_mb_s"] = disk_io.write_bytes / 1024**2
-    except:
-        pass
-    
-    return metrics
+    return run
 
 
-def log_model_gradients(model, step):
-    """Log gradient statistics to wandb"""
-    gradients = []
-    gradient_norms = []
-    
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad = param.grad.data
-            gradients.append(grad.flatten())
-            gradient_norms.append(grad.norm().item())
-    
-    if gradients:
-        all_gradients = torch.cat(gradients)
-        
-        wandb.log({
-            "gradients/mean": all_gradients.mean().item(),
-            "gradients/std": all_gradients.std().item(),
-            "gradients/max": all_gradients.max().item(),
-            "gradients/min": all_gradients.min().item(),
-            "gradients/norm_mean": torch.tensor(gradient_norms).mean().item(),
-            "gradients/norm_max": max(gradient_norms),
-            "gradients/norm_min": min(gradient_norms),
-        }, step=step)
+def log_metrics(metrics: Dict[str, float], step: int):
+    """Log metrics to wandb."""
+    wandb.log(metrics, step=step)
 
 
-def log_model_weights(model, step):
-    """Log weight statistics to wandb"""
-    weights = []
-    weight_norms = []
+def log_puzzle_examples(examples: list, step: int):
+    """Log puzzle examples to wandb as a table."""
+    columns = ["Puzzle", "True Solution", "Predicted Solution", "Correct"]
+    data = []
     
-    for name, param in model.named_parameters():
-        if param.data is not None:
-            weight = param.data
-            weights.append(weight.flatten())
-            weight_norms.append(weight.norm().item())
+    for ex in examples:
+        data.append([
+            ex['puzzle'][:200] + "..." if len(ex['puzzle']) > 200 else ex['puzzle'],
+            ex['true_solution'],
+            ex['pred_solution'],
+            "✓" if ex['correct'] else "✗"
+        ])
     
-    if weights:
-        all_weights = torch.cat(weights)
-        
-        wandb.log({
-            "weights/mean": all_weights.mean().item(),
-            "weights/std": all_weights.std().item(),
-            "weights/max": all_weights.max().item(),
-            "weights/min": all_weights.min().item(),
-            "weights/norm_mean": torch.tensor(weight_norms).mean().item(),
-            "weights/norm_max": max(weight_norms),
-            "weights/norm_min": min(weight_norms),
-        }, step=step)
+    table = wandb.Table(columns=columns, data=data)
+    wandb.log({"puzzle_examples": table}, step=step)
+
+
+def save_model_artifact(
+    model_path: str,
+    name: str,
+    type: str = "model",
+    metadata: Optional[Dict[str, Any]] = None
+):
+    """Save model as wandb artifact."""
+    artifact = wandb.Artifact(
+        name=name,
+        type=type,
+        metadata=metadata
+    )
+    artifact.add_file(model_path)
+    wandb.log_artifact(artifact)
+
+
+def finish_run():
+    """Finish wandb run."""
+    wandb.finish()
