@@ -106,6 +106,15 @@ class KnightsKnavesTokenizer:
         # Combine puzzle and solution
         return puzzle_indices + solution_indices
     
+    def encode(self, text: str) -> List[int]:
+        """Generic encode method that tries to detect if input is puzzle or solution."""
+        # Simple heuristic: if text contains function names, it's a puzzle
+        if any(func in text for func in self.functions):
+            return self.encode_puzzle(text)
+        else:
+            # Assume it's a solution
+            return self.encode_solution(text)
+    
     def decode(self, indices: List[int]) -> str:
         """Decode a list of token indices back to text."""
         tokens = []

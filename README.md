@@ -1,76 +1,65 @@
 # KnightKnaves GPT (knkgpt)
 
-A GPT model trained on Knights and Knaves logical puzzles. This project adapts the minGPT architecture to learn to solve Knights and Knaves puzzles, where some islanders always tell the truth (Knights) and others always lie (Knaves).
+A GPT model trained on Knights and Knaves logical puzzles with automatic single/multi-GPU support. This project adapts the minGPT architecture to learn to solve Knights and Knaves puzzles, where some islanders always tell the truth (Knights) and others always lie (Knaves).
 
-## Setup
-
-This project uses [uv](https://astral.sh/uv) for dependency management.
+## 🚀 Quick Start
 
 ```bash
-# Install uv if you haven't already
+# Clone the repository
+git clone https://github.com/yourusername/knkgpt.git
+cd knkgpt
+
+# Install dependencies
+pip install -e .
+
+# Run training (automatically detects and uses all available GPUs)
+python run_training.py
+
+# Or use specific configurations
+python run_training.py --config small --gpus 2  # Small model on 2 GPUs
+python run_training.py --config debug           # Quick debug run
+python run_training.py --pretokenized           # Use pre-tokenized data
+```
+
+## 🎯 Features
+
+- **Automatic GPU Detection**: Seamlessly runs on single GPU, multi-GPU, or CPU
+- **Distributed Training**: Built-in support for multi-GPU training with proper wandb logging
+- **Smart Launcher**: `run_training.py` automatically configures optimal settings
+- **Pre-tokenization Support**: 5-10x faster training with pre-tokenized datasets
+- **Wandb Integration**: Automatic experiment tracking and visualization
+
+## 📦 Installation
+
+### Option 1: pip (Recommended for SSH machines)
+```bash
+pip install -e .
+```
+
+### Option 2: uv (Fast dependency management)
+```bash
+# Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies
 uv pip sync
-
-# Or install in editable mode
+# Or
 uv pip install -e .
 ```
 
-## Project Structure
+## 🏃 Training
 
-```
-knkgpt/
-├── data/
-│   ├── knights_knaves/     # Tokenizer for K&K puzzles
-│   └── n_2.jsonl          # Dataset of 100M puzzles with 2 islanders
-├── mingpt/                # Model architecture and training
-│   ├── model.py          # GPT model
-│   ├── dataset.py        # Dataset and data loading
-│   ├── trainer.py        # Training loop
-│   ├── utils.py          # Utilities
-│   └── wandb_utils.py    # Weights & Biases integration
-├── train_gpt_knights_knaves.py    # Training script
-└── train_gpt_knights_knaves.ipynb # Training notebook
-```
-
-## Training
-
-### Quick Start: Pre-tokenized Training (Recommended)
-
-For optimal performance, especially with large datasets, use pre-tokenized data:
-
+### Easiest Way: Smart Launcher
 ```bash
-# Pre-tokenize and train in one command
-./scripts/pretokenize_and_train.sh
+# Automatically detects GPUs and runs optimal configuration
+python run_training.py
+
+# With options
+python run_training.py --config large --gpus 4
+python run_training.py --pretokenized --resume checkpoints/latest.pt
 ```
 
-This script will:
-1. Pre-tokenize the dataset if not already done
-2. Launch training with optimized data loading
-
-### Manual Pre-tokenization
-
-```bash
-# Step 1: Pre-tokenize the dataset (do this once)
-python pretokenize_dataset.py \
-    --input ./data/n_2.jsonl \
-    --output ./data/tokenized \
-    --max_length 512
-
-# Step 2: Train with pre-tokenized data
-python train_gpt_knights_knaves.py \
-    --pretokenized_dir ./data/tokenized \
-    --n_layer 8 \
-    --n_head 8 \
-    --n_embd 512 \
-    --batch_size 64 \
-    --max_epochs 10 \
-    --wandb_project knkgpt
-```
-
-### Traditional Training (without pre-tokenization)
-
+### Manual Launch (Single GPU)
 ```bash
 python train_gpt_knights_knaves.py \
     --data_path ./data/n_2.jsonl \
@@ -78,37 +67,60 @@ python train_gpt_knights_knaves.py \
     --n_head 8 \
     --n_embd 512 \
     --batch_size 64 \
-    --max_epochs 10 \
-    --wandb_project knkgpt
+    --max_epochs 10
 ```
 
-### Benchmarking Data Loading
-
-Compare performance between original and pre-tokenized datasets:
-
+### Manual Launch (Multi-GPU)
 ```bash
-python benchmark_data_loading.py \
+# For 4 GPUs
+torchrun --nproc_per_node=4 train_gpt_knights_knaves.py \
+    --data_path ./data/n_2.jsonl \
+    --n_layer 8 \
+    --n_head 8 \
+    --n_embd 512 \
     --batch_size 64 \
-    --num_workers 4 \
-    --n_batches 100
+    --max_epochs 10
 ```
 
-## Custom Tokenizer
+### Pre-tokenized Training (Faster)
+```bash
+# Step 1: Pre-tokenize the dataset (one-time)
+python pretokenize_dataset.py \
+    --input ./data/n_2.jsonl \
+    --output ./data/tokenized \
+    --max_length 512
 
-The project includes a custom tokenizer specifically designed for Knights and Knaves puzzles. It tokenizes:
-- Logical operators: `and`, `or`, `not`, `iff`, `imp`, `tt`, `ff`
-- Functions: `isKnight`, `isKnave`, `says`
-- Islander identifiers: `0`, `1`, etc.
-- Solutions: `K` (Knight), `N` (Knave)
+# Step 2: Train with pre-tokenized data
+python run_training.py --pretokenized
+```
 
-## Model Architecture
+## 🔧 Configuration Presets
 
-- **Architecture**: GPT-style transformer
-- **Default config**: 8 layers, 8 attention heads, 512 embedding dimensions
-- **Context length**: 512 tokens
-- **Vocabulary size**: 29 tokens
+The `run_training.py` script includes several presets:
 
-## Dataset Format
+- **`default`**: Standard configuration (8 layers, 8 heads, 512 dim)
+- **`small`**: Smaller model for testing (4 layers, 4 heads, 256 dim)
+- **`large`**: Larger model (12 layers, 12 heads, 768 dim)
+- **`debug`**: Quick debugging run (10k samples, 2 epochs)
+
+## 📊 Project Structure
+
+```
+knkgpt/
+├── run_training.py        # 🚀 Smart training launcher (start here!)
+├── train_gpt_knights_knaves.py    # Main training script
+├── data/
+│   ├── knights_knaves/    # Custom tokenizer
+│   └── n_2.jsonl         # Dataset (100M puzzles)
+├── mingpt/               # Model architecture
+│   ├── model.py         # GPT implementation
+│   ├── trainer.py       # Training loop (distributed-aware)
+│   ├── dataset.py       # Data loading
+│   └── utils.py         # Utilities
+└── scripts/             # Helper scripts
+```
+
+## 🧩 Dataset Format
 
 The dataset is in JSONL format with each line containing:
 ```json
@@ -118,35 +130,77 @@ The dataset is in JSONL format with each line containing:
 }
 ```
 
-## Pre-tokenization Benefits
+Where:
+- `0`, `1` are islander identifiers
+- `K` = Knight (truth-teller), `N` = Knave (liar)
+- Logical operators: `and`, `or`, `not`, `iff`, `imp`, `tt` (true), `ff` (false)
 
-Pre-tokenizing your dataset provides significant performance improvements:
+## 📈 Monitoring
 
-- **Faster Training**: Eliminates CPU tokenization bottleneck during training
-- **Reduced Memory Usage**: Data is memory-mapped from disk instead of loaded entirely into RAM
-- **Better GPU Utilization**: Optimized data loading with pinned memory for faster CPU-GPU transfers
-- **Scalability**: Can handle datasets larger than available RAM (e.g., 100M puzzles)
-
-For a 100M puzzle dataset:
-- Pre-tokenization time: ~30-60 minutes (one-time cost)
-- Storage: ~50-100 GB on disk (depending on sequence length)
-- Training speedup: 5-10x faster data loading
-
-## Monitoring Training
-
-Training progress is logged to [Weights & Biases](https://wandb.ai). The training script logs:
-- Training/validation loss
+Training automatically logs to [Weights & Biases](https://wandb.ai):
+- Loss curves and learning rate
 - Puzzle solving accuracy
-- Per-solution-type accuracy (e.g., KK, KN, NK, NN)
+- Per-solution-type accuracy (KK, KN, NK, NN)
 - Example predictions
+- GPU utilization (if available)
 
-## Checkpoints
+View your runs at: https://wandb.ai/your-username/knkgpt
 
-Model checkpoints are saved to `./ckpts/knkgpt/` including:
-- `best_model.pt`: Best model by validation loss
-- `checkpoint_STEP.pt`: Regular checkpoints during training
-- `final_model.pt`: Final model after training
+## 💾 Checkpoints
 
-## License
+Models are saved to `./ckpts/knkgpt/`:
+- `checkpoint_0.pt`: Initial model
+- `checkpoint_1000.pt`, `checkpoint_2000.pt`, ...: Regular saves
+- `best_model.pt`: Best validation loss
+- `final_model.pt`: End of training
+
+Resume training:
+```bash
+python run_training.py --resume ./ckpts/knkgpt/checkpoint_5000.pt
+```
+
+## ⚡ Performance Tips
+
+1. **Use Pre-tokenization**: 5-10x faster data loading
+   ```bash
+   python pretokenize_dataset.py --input data/n_2.jsonl --output data/tokenized
+   python run_training.py --pretokenized
+   ```
+
+2. **Multi-GPU Training**: Automatically enabled when GPUs available
+   ```bash
+   python run_training.py  # Uses all GPUs automatically
+   ```
+
+3. **Mixed Precision**: Enable for faster training (coming soon)
+
+4. **Optimal Batch Size**: 
+   - Single GPU: 64-128
+   - Multi-GPU: 32-64 per GPU
+
+## 🐛 Troubleshooting
+
+### CUDA Out of Memory
+```bash
+# Reduce batch size
+python train_gpt_knights_knaves.py --batch_size 32
+
+# Or use gradient accumulation (coming soon)
+```
+
+### Wandb Errors in Distributed Training
+The code automatically handles wandb initialization only on the main process. If you still see errors, ensure you're using the latest version:
+```bash
+pip install --upgrade wandb
+```
+
+### Slow Data Loading
+Use pre-tokenized datasets:
+```bash
+python pretokenize_dataset.py --input data/n_2.jsonl --output data/tokenized
+python run_training.py --pretokenized
+```
+
+## 📄 License
 
 This project is based on minGPT by Andrej Karpathy and the othello_world repository architecture.

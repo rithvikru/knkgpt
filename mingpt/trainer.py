@@ -46,22 +46,40 @@ class TrainerConfig:
 class Trainer:
     """Trainer for GPT model."""
     
-    def __init__(self, model, train_dataset, val_dataset, config):
+    def __init__(self, model, train_dataset, val_dataset, config, rank=0, world_size=1, is_distributed=False):
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.config = config
+        self.rank = rank
+        self.world_size = world_size
+        self.is_distributed = is_distributed
         
         # Create checkpoint directory
         os.makedirs(config.ckpt_dir, exist_ok=True)
         
         # Take over whatever gpus are on the system
         self.device = config.device
-        if self.device == 'cuda':
-            self.model = self.model.cuda()
-            if torch.cuda.device_count() > 1:
-                print(f"Using {torch.cuda.device_count()} GPUs")
+        
+        if 'cuda' in str(self.device):
+            self.model = self.model.to(self.device)
+            
+            if self.is_distributed:
+                # Use DistributedDataParallel for multi-GPU training
+                from torch.nn.parallel import DistributedDataParallel
+                self.model = DistributedDataParallel(
+                    self.model, 
+                    device_ids=[int(self.device.split(':')[-1])],
+                    output_device=int(self.device.split(':')[-1])
+                )
+                if self.rank == 0:
+                    print(f"Using DistributedDataParallel on {self.world_size} GPUs")
+            elif torch.cuda.device_count() > 1:
+                # Use DataParallel for single-node multi-GPU
+                print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
                 self.model = DataParallel(self.model)
+        else:
+            self.model = self.model.to(self.device)
                 
         self.raw_model = self.model.module if hasattr(self.model, "module") else self.model
         
@@ -78,10 +96,25 @@ class Trainer:
         model, config = self.model, self.config
         
         # Create data loaders
+        if self.is_distributed:
+            # Use distributed sampler for multi-GPU training
+            from torch.utils.data.distributed import DistributedSampler
+            train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                shuffle=True
+            )
+            shuffle = False
+        else:
+            train_sampler = None
+            shuffle = True
+            
         train_loader = torch.utils.data.DataLoader(
             self.train_dataset,
             batch_size=config.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=train_sampler,
             num_workers=config.num_workers,
             pin_memory=True,
         )
@@ -107,7 +140,13 @@ class Trainer:
             self.current_epoch = epoch
             epoch_losses = []
             
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.max_epochs}")
+            # Set epoch for distributed sampler
+            if self.is_distributed and hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
+            
+            # Only show progress bar on rank 0
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.max_epochs}", 
+                       disable=(self.rank != 0))
             
             for batch_idx, batch in enumerate(pbar):
                 # Get data
@@ -149,8 +188,8 @@ class Trainer:
                     'tokens': f"{self.tokens/1e6:.1f}M"
                 })
                 
-                # Log metrics
-                if self.global_step % config.log_every == 0:
+                # Log metrics (only on rank 0)
+                if self.global_step % config.log_every == 0 and self.rank == 0:
                     log_metrics({
                         'train/loss': loss.item(),
                         'train/lr': lr,
@@ -163,32 +202,33 @@ class Trainer:
                     val_loss = self.evaluate(val_loader)
                     val_losses.append(val_loss)
                     
-                    # Evaluate puzzle accuracy
-                    eval_results = evaluate_puzzle_accuracy(
-                        self.raw_model,
-                        val_loader,
-                        self.train_dataset.tokenizer,
-                        device=self.device,
-                        max_samples=config.eval_samples
-                    )
-                    
-                    log_metrics({
-                        'val/loss': val_loss,
-                        'val/accuracy': eval_results['overall_accuracy'],
-                        'val/correct': eval_results['correct_solutions'],
-                        'val/total': eval_results['total_puzzles'],
-                    }, step=self.global_step)
-                    
-                    # Log accuracy by solution type
-                    for sol_type, stats in eval_results['solution_type_accuracy'].items():
+                    # Evaluate puzzle accuracy (only on rank 0 to avoid duplication)
+                    if self.rank == 0:
+                        eval_results = evaluate_puzzle_accuracy(
+                            self.raw_model,
+                            val_loader,
+                            self.train_dataset.tokenizer,
+                            device=self.device,
+                            max_samples=config.eval_samples
+                        )
+                        
                         log_metrics({
-                            f'val/accuracy_{sol_type}': stats['accuracy'],
+                            'val/loss': val_loss,
+                            'val/accuracy': eval_results['overall_accuracy'],
+                            'val/correct': eval_results['correct_solutions'],
+                            'val/total': eval_results['total_puzzles'],
                         }, step=self.global_step)
+                        
+                        # Log accuracy by solution type
+                        for sol_type, stats in eval_results['solution_type_accuracy'].items():
+                            log_metrics({
+                                f'val/accuracy_{sol_type}': stats['accuracy'],
+                            }, step=self.global_step)
+                        
+                        print(f"\nVal Loss: {val_loss:.4f}, Accuracy: {eval_results['overall_accuracy']:.2%}")
                     
-                    print(f"\nVal Loss: {val_loss:.4f}, Accuracy: {eval_results['overall_accuracy']:.2%}")
-                    
-                    # Save best model
-                    if val_loss < best_val_loss:
+                    # Save best model (only on rank 0)
+                    if val_loss < best_val_loss and self.rank == 0:
                         best_val_loss = val_loss
                         save_checkpoint(
                             self.raw_model,
@@ -202,8 +242,8 @@ class Trainer:
                     
                     model.train()
                 
-                # Save checkpoint
-                if self.global_step % config.save_every == 0:
+                # Save checkpoint (only on rank 0)
+                if self.global_step % config.save_every == 0 and self.rank == 0:
                     save_checkpoint(
                         self.raw_model,
                         self.optimizer,
@@ -219,31 +259,33 @@ class Trainer:
             # End of epoch
             train_losses.extend(epoch_losses)
             
-            # Print examples
-            print(f"\n{'='*80}")
-            print(f"End of Epoch {epoch + 1} - Example Predictions:")
-            print_puzzle_examples(
-                self.raw_model,
-                val_loader,
-                self.train_dataset.tokenizer,
-                device=self.device,
-                n_examples=3
-            )
+            # Print examples (only on rank 0)
+            if self.rank == 0:
+                print(f"\n{'='*80}")
+                print(f"End of Epoch {epoch + 1} - Example Predictions:")
+                print_puzzle_examples(
+                    self.raw_model,
+                    val_loader,
+                    self.train_dataset.tokenizer,
+                    device=self.device,
+                    n_examples=3
+                )
             
         # Training complete
         elapsed = time.time() - start_time
-        print(f"\nTraining complete in {elapsed/3600:.2f} hours")
-        
-        # Save final model
-        save_checkpoint(
-            self.raw_model,
-            self.optimizer,
-            self.current_epoch,
-            self.global_step,
-            val_losses[-1] if val_losses else 0,
-            os.path.join(config.ckpt_dir, 'final_model.pt'),
-            config=config.__dict__
-        )
+        if self.rank == 0:
+            print(f"\nTraining complete in {elapsed/3600:.2f} hours")
+            
+            # Save final model
+            save_checkpoint(
+                self.raw_model,
+                self.optimizer,
+                self.current_epoch,
+                self.global_step,
+                val_losses[-1] if val_losses else 0,
+                os.path.join(config.ckpt_dir, 'final_model.pt'),
+                config=config.__dict__
+            )
         
         return train_losses, val_losses
     

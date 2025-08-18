@@ -13,6 +13,27 @@ from mingpt.utils import set_seed
 from mingpt.wandb_utils import init_wandb, finish_run
 
 
+def setup_distributed():
+    """Setup distributed training if running under torchrun/torch.distributed.launch"""
+    # Check if we're in a distributed environment
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        import torch.distributed as dist
+        
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        # Initialize the process group
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+            torch.cuda.set_device(local_rank)
+        
+        return rank, world_size, local_rank, True
+    else:
+        # Single GPU training
+        return 0, 1, 0, False
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train KnightKnaves GPT')
     
@@ -56,6 +77,15 @@ def main():
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
     
     args = parser.parse_args()
+    
+    # Setup distributed training
+    rank, world_size, local_rank, is_distributed = setup_distributed()
+    
+    # Update device if distributed
+    if is_distributed:
+        args.device = f'cuda:{local_rank}'
+        if rank == 0:
+            print(f"Running distributed training on {world_size} GPUs")
     
     # Set random seed
     set_seed(args.seed)
@@ -124,36 +154,42 @@ def main():
         device=args.device,
     )
     
-    # Initialize wandb
-    run_name = args.wandb_name or f"knkgpt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    wandb_config = {
-        'model': model_config.__dict__,
-        'training': train_config.__dict__,
-        'data': {
-            'data_path': args.data_path,
-            'n_puzzles': args.n_puzzles,
-            'train_ratio': args.train_ratio,
-            'train_size': len(data_module.train_dataset),
-            'val_size': len(data_module.val_dataset),
-        },
-        'seed': args.seed,
-    }
-    
-    run = init_wandb(
-        project=args.wandb_project,
-        name=run_name,
-        config=wandb_config,
-        tags=['knights-knaves', 'gpt', f'n_layer_{args.n_layer}', f'n_embd_{args.n_embd}'],
-        notes=f"Training GPT on Knights and Knaves puzzles with {len(data_module.train_dataset)} training examples"
-    )
+    # Initialize wandb (only on rank 0)
+    if rank == 0:
+        run_name = args.wandb_name or f"knkgpt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        wandb_config = {
+            'model': model_config.__dict__,
+            'training': train_config.__dict__,
+            'data': {
+                'data_path': args.data_path,
+                'n_puzzles': args.n_puzzles,
+                'train_ratio': args.train_ratio,
+                'train_size': len(data_module.train_dataset),
+                'val_size': len(data_module.val_dataset),
+            },
+            'seed': args.seed,
+            'distributed': is_distributed,
+            'world_size': world_size,
+        }
+        
+        run = init_wandb(
+            project=args.wandb_project,
+            name=run_name,
+            config=wandb_config,
+            tags=['knights-knaves', 'gpt', f'n_layer_{args.n_layer}', f'n_embd_{args.n_embd}'],
+            notes=f"Training GPT on Knights and Knaves puzzles with {len(data_module.train_dataset)} training examples"
+        )
     
     # Create trainer
     trainer = Trainer(
         model=model,
         train_dataset=data_module.train_dataset,
         val_dataset=data_module.val_dataset,
-        config=train_config
+        config=train_config,
+        rank=rank,
+        world_size=world_size,
+        is_distributed=is_distributed
     )
     
     # Resume if checkpoint provided
@@ -170,8 +206,14 @@ def main():
     print("Starting training...")
     train_losses, val_losses = trainer.train()
     
-    # Finish wandb run
-    finish_run()
+    # Finish wandb run (only on rank 0)
+    if rank == 0:
+        finish_run()
+    
+    # Clean up distributed training
+    if is_distributed:
+        import torch.distributed as dist
+        dist.destroy_process_group()
     
     print("Training complete!")
 
