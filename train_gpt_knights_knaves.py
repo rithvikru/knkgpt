@@ -1,222 +1,188 @@
-#!/usr/bin/env python3
 """
-Train GPT on Knights and Knaves puzzles.
+Training script for Knights and Knaves GPT.
 """
-import os
+
 import argparse
+import os
+from pathlib import Path
+
 import torch
-from datetime import datetime
+import wandb
 
-from mingpt.model import GPT, GPTConfig
+from mingpt.model import create_model, GPTConfig
+from mingpt.dataset import KnightsKnavesDataModule
 from mingpt.trainer import Trainer, TrainerConfig
-from mingpt.utils import set_seed
-from mingpt.wandb_utils import init_wandb, finish_run
 
 
-def setup_distributed():
-    """Setup distributed training if running under torchrun/torch.distributed.launch"""
-    # Check if we're in a distributed environment
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        import torch.distributed as dist
-        
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        
-        # Initialize the process group
-        if not dist.is_initialized():
-            dist.init_process_group(backend='nccl')
-            torch.cuda.set_device(local_rank)
-        
-        return rank, world_size, local_rank, True
-    else:
-        # Single GPU training
-        return 0, 1, 0, False
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train KnKGPT on Knights and Knaves puzzles")
+    
+    # Data arguments
+    parser.add_argument("--data_path", type=str, default="data/n_2.jsonl",
+                       help="Path to training data")
+    parser.add_argument("--max_samples", type=int, default=None,
+                       help="Maximum number of samples to use (None for all)")
+    parser.add_argument("--train_split", type=float, default=0.95,
+                       help="Fraction of data to use for training")
+    
+    # Model arguments
+    parser.add_argument("--n_embd", type=int, default=512,
+                       help="Embedding dimension")
+    parser.add_argument("--n_layer", type=int, default=8,
+                       help="Number of transformer layers")
+    parser.add_argument("--n_head", type=int, default=8,
+                       help="Number of attention heads")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                       help="Dropout probability")
+    
+    # Training arguments
+    parser.add_argument("--batch_size", type=int, default=128,
+                       help="Batch size")
+    parser.add_argument("--learning_rate", type=float, default=3e-4,
+                       help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.1,
+                       help="Weight decay")
+    parser.add_argument("--max_epochs", type=int, default=10,
+                       help="Maximum number of epochs")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                       help="Number of warmup steps")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                       help="Number of gradient accumulation steps")
+    parser.add_argument("--grad_norm_clip", type=float, default=1.0,
+                       help="Gradient norm clipping")
+    
+    # Checkpointing arguments
+    parser.add_argument("--ckpt_path", type=str, default="ckpts/knkgpt",
+                       help="Path to save checkpoints")
+    parser.add_argument("--save_every", type=int, default=5000,
+                       help="Save checkpoint every N steps")
+    parser.add_argument("--eval_every", type=int, default=1000,
+                       help="Evaluate every N steps")
+    parser.add_argument("--log_every", type=int, default=100,
+                       help="Log metrics every N steps")
+    parser.add_argument("--resume_from", type=str, default=None,
+                       help="Path to checkpoint to resume from")
+    
+    # Wandb arguments
+    parser.add_argument("--wandb_project", type=str, default="knkgpt",
+                       help="Wandb project name")
+    parser.add_argument("--wandb_name", type=str, default=None,
+                       help="Wandb run name")
+    parser.add_argument("--wandb_notes", type=str, default=None,
+                       help="Wandb run notes")
+    parser.add_argument("--wandb_offline", action="store_true",
+                       help="Run wandb in offline mode")
+    
+    # Other arguments
+    parser.add_argument("--seed", type=int, default=42,
+                       help="Random seed")
+    parser.add_argument("--num_workers", type=int, default=4,
+                       help="Number of data loading workers")
+    parser.add_argument("--device", type=str, default="auto",
+                       help="Device to use (cuda/mps/cpu/auto)")
+    parser.add_argument("--use_amp", action="store_true",
+                       help="Use automatic mixed precision")
+    
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train KnightKnaves GPT')
+    args = parse_args()
     
-    # Model arguments
-    parser.add_argument('--n_layer', type=int, default=8, help='Number of transformer layers')
-    parser.add_argument('--n_head', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--n_embd', type=int, default=512, help='Embedding dimension')
-    parser.add_argument('--block_size', type=int, default=512, help='Maximum sequence length')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout probability')
+    # Set random seeds
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        
+    # Set device
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+        
+    print(f"Using device: {device}")
     
-    # Data arguments
-    parser.add_argument('--data_path', type=str, default='./data/n_2.jsonl', help='Path to data file')
-    parser.add_argument('--pretokenized_dir', type=str, default=None, help='Path to pre-tokenized data directory')
-    parser.add_argument('--n_puzzles', type=int, default=None, help='Number of puzzles to use (None for all)')
-    parser.add_argument('--train_ratio', type=float, default=0.98, help='Train/val split ratio')
-    
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
-    parser.add_argument('--learning_rate', type=float, default=6e-4, help='Learning rate')
-    parser.add_argument('--max_epochs', type=int, default=10, help='Maximum epochs')
-    parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
-    parser.add_argument('--grad_norm_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--warmup_tokens', type=float, default=375e6, help='Warmup tokens')
-    parser.add_argument('--final_tokens', type=float, default=100e9, help='Final tokens for LR decay')
-    
-    # System arguments
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of data workers')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    # Logging arguments
-    parser.add_argument('--wandb_project', type=str, default='knkgpt', help='Wandb project name')
-    parser.add_argument('--wandb_name', type=str, default=None, help='Wandb run name')
-    parser.add_argument('--ckpt_dir', type=str, default='./ckpts/knkgpt', help='Checkpoint directory')
-    parser.add_argument('--log_every', type=int, default=10, help='Log every N steps')
-    parser.add_argument('--eval_every', type=int, default=500, help='Evaluate every N steps')
-    parser.add_argument('--save_every', type=int, default=1000, help='Save checkpoint every N steps')
-    parser.add_argument('--eval_samples', type=int, default=1000, help='Number of samples for evaluation')
-    
-    # Resume training
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
-    
-    args = parser.parse_args()
-    
-    # Setup distributed training
-    rank, world_size, local_rank, is_distributed = setup_distributed()
-    
-    # Update device if distributed
-    if is_distributed:
-        args.device = f'cuda:{local_rank}'
-        if rank == 0:
-            print(f"Running distributed training on {world_size} GPUs")
-    
-    # Set random seed
-    set_seed(args.seed)
-    
+    # Set wandb mode
+    if args.wandb_offline:
+        os.environ["WANDB_MODE"] = "offline"
+        
     # Create data module
     print("Loading data...")
-    
-    if args.pretokenized_dir:
-        print(f"Using pre-tokenized data from: {args.pretokenized_dir}")
-        from mingpt.pretokenized_dataset import PreTokenizedDataModule
-        data_module = PreTokenizedDataModule(
-            data_dir=args.pretokenized_dir,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=args.device,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True,
-        )
-    else:
-        print(f"Loading raw data from: {args.data_path}")
-        from mingpt.dataset import KnightsKnavesDataModule
-        data_module = KnightsKnavesDataModule(
-            data_path=args.data_path,
-            batch_size=args.batch_size,
-            max_length=args.block_size,
-            n_puzzles=args.n_puzzles,
-            num_workers=args.num_workers,
-            train_ratio=args.train_ratio,
-            seed=args.seed,
-        )
-    
-    # Create model config
-    model_config = GPTConfig(
-        vocab_size=data_module.get_vocab_size(),
-        block_size=data_module.get_block_size(),
-        n_layer=args.n_layer,
-        n_head=args.n_head,
-        n_embd=args.n_embd,
-        embd_pdrop=args.dropout,
-        resid_pdrop=args.dropout,
-        attn_pdrop=args.dropout,
+    data_module = KnightsKnavesDataModule(
+        data_path=args.data_path,
+        batch_size=args.batch_size,
+        max_length=512,
+        num_workers=args.num_workers,
+        train_split=args.train_split,
+        seed=args.seed,
+        max_samples=args.max_samples
     )
+    
+    train_loader = data_module.train_dataloader()
+    val_loader = data_module.val_dataloader()
     
     # Create model
     print("Creating model...")
-    model = GPT(model_config)
+    model_config = GPTConfig(
+        vocab_size=data_module.vocab_size,
+        n_positions=512,
+        n_embd=args.n_embd,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_inner=4 * args.n_embd,
+        resid_pdrop=args.dropout,
+        embd_pdrop=args.dropout,
+        attn_pdrop=args.dropout,
+    )
+    model = create_model(vocab_size=data_module.vocab_size)
     
     # Create trainer config
-    train_config = TrainerConfig(
+    trainer_config = TrainerConfig(
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        adam_epsilon=1e-8,
+        adam_betas=(0.9, 0.95),
+        grad_norm_clip=args.grad_norm_clip,
+        warmup_steps=args.warmup_steps,
+        lr_decay=True,
         max_epochs=args.max_epochs,
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        betas=(0.9, 0.95),
-        grad_norm_clip=args.grad_norm_clip,
-        weight_decay=args.weight_decay,
-        lr_decay=True,
-        warmup_tokens=args.warmup_tokens,
-        final_tokens=args.final_tokens,
-        ckpt_dir=args.ckpt_dir,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        ckpt_path=args.ckpt_path,
         save_every=args.save_every,
         log_every=args.log_every,
         eval_every=args.eval_every,
-        eval_samples=args.eval_samples,
-        num_workers=args.num_workers,
-        device=args.device,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name or f"knkgpt_bs{args.batch_size}_lr{args.learning_rate}",
+        wandb_notes=args.wandb_notes,
+        device=device,
+        use_amp=args.use_amp and device == "cuda",
     )
-    
-    # Initialize wandb (only on rank 0)
-    if rank == 0:
-        run_name = args.wandb_name or f"knkgpt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        wandb_config = {
-            'model': model_config.__dict__,
-            'training': train_config.__dict__,
-            'data': {
-                'data_path': args.data_path,
-                'n_puzzles': args.n_puzzles,
-                'train_ratio': args.train_ratio,
-                'train_size': len(data_module.train_dataset),
-                'val_size': len(data_module.val_dataset),
-            },
-            'seed': args.seed,
-            'distributed': is_distributed,
-            'world_size': world_size,
-        }
-        
-        run = init_wandb(
-            project=args.wandb_project,
-            name=run_name,
-            config=wandb_config,
-            tags=['knights-knaves', 'gpt', f'n_layer_{args.n_layer}', f'n_embd_{args.n_embd}'],
-            notes=f"Training GPT on Knights and Knaves puzzles with {len(data_module.train_dataset)} training examples"
-        )
     
     # Create trainer
-    trainer = Trainer(
-        model=model,
-        train_dataset=data_module.train_dataset,
-        val_dataset=data_module.val_dataset,
-        config=train_config,
-        rank=rank,
-        world_size=world_size,
-        is_distributed=is_distributed
-    )
+    trainer = Trainer(model, trainer_config)
     
-    # Resume if checkpoint provided
-    if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=args.device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        trainer.global_step = checkpoint['step']
-        trainer.current_epoch = checkpoint['epoch']
-        print(f"Resumed from epoch {trainer.current_epoch}, step {trainer.global_step}")
-    
+    # Resume from checkpoint if specified
+    if args.resume_from:
+        trainer.load_checkpoint(args.resume_from)
+        
     # Train
     print("Starting training...")
-    train_losses, val_losses = trainer.train()
+    trainer.train(train_loader, val_loader)
     
-    # Finish wandb run (only on rank 0)
-    if rank == 0:
-        finish_run()
+    print("Training completed!")
     
-    # Clean up distributed training
-    if is_distributed:
-        import torch.distributed as dist
-        dist.destroy_process_group()
-    
-    print("Training complete!")
+    # Generate some samples at the end
+    print("\nGenerating sample predictions:")
+    samples = trainer.generate_samples(data_module.tokenizer, num_samples=5)
+    for i, sample in enumerate(samples):
+        print(f"\nSample {i+1}: {sample}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

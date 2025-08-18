@@ -1,305 +1,344 @@
 """
-Trainer for Knights and Knaves GPT.
+Trainer for GPT model with wandb integration.
 """
+
 import os
+import math
+import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DataParallel
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import wandb
 from tqdm import tqdm
-import numpy as np
-from typing import Optional, Dict, Any, Callable
-import time
 
-from .utils import save_checkpoint, evaluate_puzzle_accuracy, print_puzzle_examples
-from .wandb_utils import log_metrics, log_puzzle_examples as log_puzzle_examples_wandb
+from .model import GPT, GPTConfig
 
 
+@dataclass
 class TrainerConfig:
     """Configuration for training."""
-    # Optimization parameters
-    max_epochs = 10
-    batch_size = 64
-    learning_rate = 6e-4
-    betas = (0.9, 0.95)
-    grad_norm_clip = 1.0
-    weight_decay = 0.1
-    # Learning rate schedule
-    lr_decay = True
-    warmup_tokens = 375e6  # 375 million tokens
-    final_tokens = 100e9   # 100 billion tokens
-    # Checkpointing
-    ckpt_dir = './ckpts/knkgpt'
-    save_every = 1000
-    # Logging
-    log_every = 10
-    eval_every = 500
-    eval_samples = 1000
-    # System
-    num_workers = 4
-    device = 'cuda'
+    # Optimization
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.1
+    adam_epsilon: float = 1e-8
+    adam_betas: tuple = (0.9, 0.95)
+    grad_norm_clip: float = 1.0
     
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-
+    # Learning rate schedule
+    warmup_steps: int = 1000
+    lr_decay: bool = True
+    
+    # Training
+    max_epochs: int = 10
+    batch_size: int = 32
+    gradient_accumulation_steps: int = 1
+    
+    # Checkpointing
+    ckpt_path: str = "ckpts/knkgpt"
+    save_every: int = 1000  # save checkpoint every N steps
+    
+    # Logging
+    log_every: int = 10  # log metrics every N steps
+    eval_every: int = 500  # run validation every N steps
+    
+    # Wandb
+    wandb_project: str = "knkgpt"
+    wandb_name: Optional[str] = None
+    wandb_notes: Optional[str] = None
+    
+    # Device
+    device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    
+    # Mixed precision
+    use_amp: bool = True
+    
+    
 class Trainer:
     """Trainer for GPT model."""
     
-    def __init__(self, model, train_dataset, val_dataset, config, rank=0, world_size=1, is_distributed=False):
+    def __init__(self, model: GPT, config: TrainerConfig):
         self.model = model
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
         self.config = config
-        self.rank = rank
-        self.world_size = world_size
-        self.is_distributed = is_distributed
         
-        # Create checkpoint directory
-        os.makedirs(config.ckpt_dir, exist_ok=True)
+        # Move model to device
+        self.device = torch.device(config.device)
+        self.model = self.model.to(self.device)
         
-        # Take over whatever gpus are on the system
-        self.device = config.device
+        # Setup mixed precision
+        self.scaler = torch.cuda.amp.GradScaler() if config.use_amp and config.device == "cuda" else None
         
-        if 'cuda' in str(self.device):
-            self.model = self.model.to(self.device)
-            
-            if self.is_distributed:
-                # Use DistributedDataParallel for multi-GPU training
-                from torch.nn.parallel import DistributedDataParallel
-                self.model = DistributedDataParallel(
-                    self.model, 
-                    device_ids=[int(self.device.split(':')[-1])],
-                    output_device=int(self.device.split(':')[-1])
-                )
-                if self.rank == 0:
-                    print(f"Using DistributedDataParallel on {self.world_size} GPUs")
-            elif torch.cuda.device_count() > 1:
-                # Use DataParallel for single-node multi-GPU
-                print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-                self.model = DataParallel(self.model)
-        else:
-            self.model = self.model.to(self.device)
-                
-        self.raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        # Setup optimizer
+        self.optimizer = self._create_optimizer()
         
-        # Set up optimizer
-        self.optimizer = self.raw_model.configure_optimizers(config)
+        # Setup checkpoint directory
+        os.makedirs(config.ckpt_path, exist_ok=True)
         
-        # Training state
-        self.tokens = 0  # Counter for processed tokens
+        # Initialize tracking variables
         self.global_step = 0
-        self.current_epoch = 0
+        self.start_epoch = 0
         
-    def train(self):
-        """Main training loop."""
-        model, config = self.model, self.config
+    def _create_optimizer(self):
+        """Create AdamW optimizer with weight decay fix."""
+        # Separate parameters that should and shouldn't have weight decay
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (nn.Linear,)
+        blacklist_weight_modules = (nn.LayerNorm, nn.Embedding)
         
-        # Create data loaders
-        if self.is_distributed:
-            # Use distributed sampler for multi-GPU training
-            from torch.utils.data.distributed import DistributedSampler
-            train_sampler = DistributedSampler(
-                self.train_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True
-            )
-            shuffle = False
+        for mn, m in self.model.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = f"{mn}.{pn}" if mn else pn
+                
+                if pn.endswith('bias'):
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+                    
+        # Validate that we considered every parameter
+        param_dict = {pn: p for pn, p in self.model.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, f"Parameters {inter_params} are in both decay/no_decay sets"
+        assert len(param_dict.keys() - union_params) == 0, \
+            f"Parameters {param_dict.keys() - union_params} were not separated into decay/no_decay"
+            
+        # Create optimizer groups
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": self.config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        
+        optimizer = AdamW(optim_groups, lr=self.config.learning_rate, 
+                         betas=self.config.adam_betas, eps=self.config.adam_epsilon)
+        return optimizer
+        
+    def _get_lr(self):
+        """Get learning rate with warmup and cosine decay."""
+        if not self.config.lr_decay:
+            return self.config.learning_rate
+            
+        # Warmup
+        if self.global_step < self.config.warmup_steps:
+            lr_mult = self.global_step / max(1, self.config.warmup_steps)
         else:
-            train_sampler = None
-            shuffle = True
+            # Cosine decay
+            progress = (self.global_step - self.config.warmup_steps) / \
+                      max(1, self.total_steps - self.config.warmup_steps)
+            lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
             
-        train_loader = torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=config.batch_size,
-            shuffle=shuffle,
-            sampler=train_sampler,
-            num_workers=config.num_workers,
-            pin_memory=True,
+        return self.config.learning_rate * lr_mult
+        
+    def _set_lr(self, lr):
+        """Set learning rate for all parameter groups."""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+            
+    def save_checkpoint(self, epoch: int, val_loss: Optional[float] = None):
+        """Save model checkpoint."""
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epoch': epoch,
+            'global_step': self.global_step,
+            'config': self.config,
+            'model_config': self.model.config,
+            'val_loss': val_loss,
+        }
+        
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+            
+        path = os.path.join(self.config.ckpt_path, f'checkpoint_step_{self.global_step}.pt')
+        torch.save(checkpoint, path)
+        
+        # Also save as latest
+        latest_path = os.path.join(self.config.ckpt_path, 'checkpoint_latest.pt')
+        torch.save(checkpoint, latest_path)
+        
+        print(f"Saved checkpoint to {path}")
+        
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.start_epoch = checkpoint['epoch']
+        self.global_step = checkpoint['global_step']
+        
+        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+        print(f"Loaded checkpoint from {path} (epoch {self.start_epoch}, step {self.global_step})")
+        
+    def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None):
+        """Main training loop."""
+        # Initialize wandb
+        wandb.init(
+            project=self.config.wandb_project,
+            name=self.config.wandb_name,
+            notes=self.config.wandb_notes,
+            config={
+                'model_config': self.model.config.__dict__,
+                'trainer_config': self.config.__dict__,
+                'n_params': sum(p.numel() for p in self.model.parameters()),
+            }
         )
         
-        val_loader = torch.utils.data.DataLoader(
-            self.val_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=True,
-        )
+        # Calculate total steps
+        steps_per_epoch = len(train_loader) // self.config.gradient_accumulation_steps
+        self.total_steps = steps_per_epoch * self.config.max_epochs
         
-        model.train()
-        best_val_loss = float('inf')
+        # Training loop
+        self.model.train()
         
-        # Training metrics
-        train_losses = []
-        val_losses = []
-        
-        start_time = time.time()
-        
-        for epoch in range(config.max_epochs):
-            self.current_epoch = epoch
-            epoch_losses = []
+        for epoch in range(self.start_epoch, self.config.max_epochs):
+            epoch_loss = 0.0
+            epoch_start_time = time.time()
             
-            # Set epoch for distributed sampler
-            if self.is_distributed and hasattr(train_loader.sampler, 'set_epoch'):
-                train_loader.sampler.set_epoch(epoch)
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.max_epochs}")
             
-            # Only show progress bar on rank 0
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.max_epochs}", 
-                       disable=(self.rank != 0))
-            
-            for batch_idx, batch in enumerate(pbar):
-                # Get data
-                x = batch['input'].to(self.device)
-                y = batch['target'].to(self.device)
+            for step, batch in enumerate(progress_bar):
+                # Move batch to device
+                batch = {k: v.to(self.device) for k, v in batch.items()}
                 
                 # Forward pass
-                logits, loss = model(x, y)
-                epoch_losses.append(loss.item())
-                
-                # Backward pass
-                model.zero_grad()
-                loss.backward()
-                if config.grad_norm_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_norm_clip)
-                self.optimizer.step()
-                
-                # Decay learning rate if configured
-                if config.lr_decay:
-                    self.tokens += (y >= 0).sum()  # Count non-padding tokens
-                    if self.tokens < config.warmup_tokens:
-                        # Linear warmup
-                        lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
-                    else:
-                        # Cosine decay
-                        progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
-                        lr_mult = max(0.1, 0.5 * (1.0 + np.cos(np.pi * progress)))
-                    
-                    lr = config.learning_rate * lr_mult
-                    for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = lr
-                else:
-                    lr = config.learning_rate
-                
-                # Update progress bar
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'lr': f"{lr:.2e}",
-                    'tokens': f"{self.tokens/1e6:.1f}M"
-                })
-                
-                # Log metrics (only on rank 0)
-                if self.global_step % config.log_every == 0 and self.rank == 0:
-                    log_metrics({
-                        'train/loss': loss.item(),
-                        'train/lr': lr,
-                        'train/tokens': self.tokens,
-                        'train/epoch': epoch + batch_idx / len(train_loader),
-                    }, step=self.global_step)
-                
-                # Evaluation
-                if self.global_step % config.eval_every == 0:
-                    val_loss = self.evaluate(val_loader)
-                    val_losses.append(val_loss)
-                    
-                    # Evaluate puzzle accuracy (only on rank 0 to avoid duplication)
-                    if self.rank == 0:
-                        eval_results = evaluate_puzzle_accuracy(
-                            self.raw_model,
-                            val_loader,
-                            self.train_dataset.tokenizer,
-                            device=self.device,
-                            max_samples=config.eval_samples
-                        )
-                        
-                        log_metrics({
-                            'val/loss': val_loss,
-                            'val/accuracy': eval_results['overall_accuracy'],
-                            'val/correct': eval_results['correct_solutions'],
-                            'val/total': eval_results['total_puzzles'],
-                        }, step=self.global_step)
-                        
-                        # Log accuracy by solution type
-                        for sol_type, stats in eval_results['solution_type_accuracy'].items():
-                            log_metrics({
-                                f'val/accuracy_{sol_type}': stats['accuracy'],
-                            }, step=self.global_step)
-                        
-                        print(f"\nVal Loss: {val_loss:.4f}, Accuracy: {eval_results['overall_accuracy']:.2%}")
-                    
-                    # Save best model (only on rank 0)
-                    if val_loss < best_val_loss and self.rank == 0:
-                        best_val_loss = val_loss
-                        save_checkpoint(
-                            self.raw_model,
-                            self.optimizer,
-                            epoch,
-                            self.global_step,
-                            val_loss,
-                            os.path.join(config.ckpt_dir, 'best_model.pt'),
-                            config=config.__dict__
-                        )
-                    
-                    model.train()
-                
-                # Save checkpoint (only on rank 0)
-                if self.global_step % config.save_every == 0 and self.rank == 0:
-                    save_checkpoint(
-                        self.raw_model,
-                        self.optimizer,
-                        epoch,
-                        self.global_step,
-                        epoch_losses[-1] if epoch_losses else 0,
-                        os.path.join(config.ckpt_dir, f'checkpoint_{self.global_step}.pt'),
-                        config=config.__dict__
+                with torch.cuda.amp.autocast() if self.scaler else torch.no_grad():
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch['attention_mask'],
+                        labels=batch['labels']
                     )
+                    loss = outputs['loss'] / self.config.gradient_accumulation_steps
+                    
+                # Backward pass
+                if self.scaler:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                    
+                # Gradient accumulation
+                if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                    # Clip gradients
+                    if self.config.grad_norm_clip > 0:
+                        if self.scaler:
+                            self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_norm_clip)
+                        
+                    # Update weights
+                    if self.scaler:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+                        
+                    self.optimizer.zero_grad()
+                    
+                    # Update learning rate
+                    lr = self._get_lr()
+                    self._set_lr(lr)
+                    
+                    # Update step counter
+                    self.global_step += 1
+                    
+                    # Logging
+                    if self.global_step % self.config.log_every == 0:
+                        metrics = {
+                            'train/loss': loss.item() * self.config.gradient_accumulation_steps,
+                            'train/lr': lr,
+                            'train/epoch': epoch,
+                            'train/step': self.global_step,
+                        }
+                        wandb.log(metrics, step=self.global_step)
+                        
+                    # Update progress bar
+                    progress_bar.set_postfix({
+                        'loss': f"{loss.item() * self.config.gradient_accumulation_steps:.4f}",
+                        'lr': f"{lr:.2e}"
+                    })
+                    
+                    # Validation
+                    if val_loader is not None and self.global_step % self.config.eval_every == 0:
+                        val_loss = self.evaluate(val_loader)
+                        wandb.log({'val/loss': val_loss}, step=self.global_step)
+                        self.model.train()
+                        
+                    # Save checkpoint
+                    if self.global_step % self.config.save_every == 0:
+                        self.save_checkpoint(epoch)
+                        
+                epoch_loss += loss.item()
                 
-                self.global_step += 1
-            
             # End of epoch
-            train_losses.extend(epoch_losses)
+            epoch_time = time.time() - epoch_start_time
+            avg_loss = epoch_loss / len(train_loader)
             
-            # Print examples (only on rank 0)
-            if self.rank == 0:
-                print(f"\n{'='*80}")
-                print(f"End of Epoch {epoch + 1} - Example Predictions:")
-                print_puzzle_examples(
-                    self.raw_model,
-                    val_loader,
-                    self.train_dataset.tokenizer,
-                    device=self.device,
-                    n_examples=3
-                )
+            print(f"Epoch {epoch+1} completed in {epoch_time:.2f}s, average loss: {avg_loss:.4f}")
             
-        # Training complete
-        elapsed = time.time() - start_time
-        if self.rank == 0:
-            print(f"\nTraining complete in {elapsed/3600:.2f} hours")
+            # Run validation at end of epoch
+            if val_loader is not None:
+                val_loss = self.evaluate(val_loader)
+                print(f"Validation loss: {val_loss:.4f}")
+                wandb.log({'val/loss_epoch': val_loss, 'epoch': epoch+1}, step=self.global_step)
+                
+            # Save checkpoint at end of epoch
+            self.save_checkpoint(epoch, val_loss if val_loader else None)
             
-            # Save final model
-            save_checkpoint(
-                self.raw_model,
-                self.optimizer,
-                self.current_epoch,
-                self.global_step,
-                val_losses[-1] if val_losses else 0,
-                os.path.join(config.ckpt_dir, 'final_model.pt'),
-                config=config.__dict__
-            )
+        wandb.finish()
         
-        return train_losses, val_losses
-    
-    @torch.no_grad()
-    def evaluate(self, dataloader):
+    def evaluate(self, val_loader: DataLoader) -> float:
         """Evaluate model on validation set."""
         self.model.eval()
-        losses = []
+        total_loss = 0.0
         
-        for batch in dataloader:
-            x = batch['input'].to(self.device)
-            y = batch['target'].to(self.device)
-            
-            logits, loss = self.model(x, y)
-            losses.append(loss.item())
-            
-        return np.mean(losses)
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating"):
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    labels=batch['labels']
+                )
+                
+                total_loss += outputs['loss'].item()
+                
+        avg_loss = total_loss / len(val_loader)
+        return avg_loss
+        
+    def generate_samples(self, tokenizer, num_samples: int = 5, puzzle_prefix: Optional[str] = None):
+        """Generate sample predictions for logging."""
+        self.model.eval()
+        
+        samples = []
+        
+        with torch.no_grad():
+            for i in range(num_samples):
+                if puzzle_prefix:
+                    # Use provided prefix
+                    input_ids = torch.tensor([tokenizer.encode(puzzle_prefix)]).to(self.device)
+                else:
+                    # Start with just the SOS token
+                    input_ids = torch.tensor([[tokenizer.sos_id]]).to(self.device)
+                    
+                # Generate
+                generated = self.model.generate(
+                    input_ids,
+                    max_new_tokens=100,
+                    temperature=0.8,
+                    top_k=10
+                )
+                
+                # Decode
+                generated_text = tokenizer.decode(generated[0].tolist())
+                samples.append(generated_text)
+                
+        return samples
